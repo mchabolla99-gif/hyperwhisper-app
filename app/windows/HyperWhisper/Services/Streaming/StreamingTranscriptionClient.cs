@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net.WebSockets;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using HyperWhisper.Models;
@@ -446,6 +447,28 @@ public sealed class StreamingTranscriptionClient : IAsyncDisposable, IDisposable
         }
     }
 
+    /// <summary>
+    /// Matches a confirmed streaming delta that, once trimmed, is ENTIRELY a
+    /// single filler word ("uh"/"um"/"er"), optionally with a trailing comma -
+    /// e.g. a provider that emits an already-trimmed segment that is just "uh".
+    /// Handled locally here (streaming-only, already gated to English by
+    /// <see cref="IsEnglishLanguage"/>) rather than widening
+    /// <see cref="SmartSpacing.RemoveFillerWords"/>'s regex, since that function
+    /// is also reachable from the ungated batch path
+    /// (<c>TranscriptionOrchestrator</c>) where a bare standalone-match could
+    /// erase a legitimate single-word non-English transcript (e.g. German "er").
+    /// </summary>
+    private static readonly Regex StandaloneFillerRegex =
+        new(@"^(uh|um|er),?$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>
+    /// Mirrors the leading-filler pattern <see cref="SmartSpacing.RemoveFillerWords"/>
+    /// itself checks against the ORIGINAL text before deciding whether to force a
+    /// leading capital on the surviving word.
+    /// </summary>
+    private static readonly Regex LeadingFillerRegex =
+        new(@"^\s*\b(uh|um|er)\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     internal string? AppendFinalTranscript(string text)
     {
         // Mirrors the batch path's order (TranscriptionOrchestrator.RunAsync):
@@ -472,20 +495,26 @@ public sealed class StreamingTranscriptionClient : IAsyncDisposable, IDisposable
             ? SmartSpacing.RemoveFillerWords(text)
             : text;
 
+        // SmartSpacing.RemoveFillerWords requires whitespace on at least one side of
+        // a filler (see its comment - that regex is also reachable from the ungated
+        // batch path). A confirmed streaming segment that is ENTIRELY a filler word
+        // (already trimmed, e.g. "uh") has no such risk here, since this call site is
+        // already gated to English via shouldRemoveFillers - strip it directly.
+        if (shouldRemoveFillers && StandaloneFillerRegex.IsMatch(text.Trim()))
+        {
+            withoutFillers = string.Empty;
+        }
+
         // SmartSpacing.RemoveFillerWords recapitalizes the word after a leading
         // filler on the assumption that it is processing the START of a whole
-        // transcript - true for the batch path, and for this session's very
-        // first confirmed delta. For later deltas that assumption is wrong: a
-        // filler opening a mid-transcript delta (e.g. "um, this works" following
-        // an earlier confirmed "I think") is not a sentence start, so undo the
-        // recapitalization it applied. Only reverse it when the raw delta itself
-        // opened lowercase - if the delta already opened uppercase, leave it.
-        if (shouldRemoveFillers &&
-            !isFirstConfirmedDelta &&
-            text.Length > 0 && char.IsLower(text[0]) &&
-            withoutFillers.Length > 0 && char.IsUpper(withoutFillers[0]))
+        // transcript - true for the batch path, and for this session's very first
+        // confirmed delta. For later deltas that assumption is wrong: a filler
+        // opening a mid-transcript delta (e.g. "um, this works" following an
+        // earlier confirmed "I think") is not a sentence start, so undo the
+        // recapitalization it applied.
+        if (shouldRemoveFillers && !isFirstConfirmedDelta)
         {
-            withoutFillers = char.ToLower(withoutFillers[0]) + withoutFillers.Substring(1);
+            withoutFillers = RevertMidTranscriptRecapitalization(text, withoutFillers);
         }
 
         var processed = TranscriptionTextProcessing.ProcessVoiceCommands(withoutFillers).Trim();
@@ -505,6 +534,41 @@ public sealed class StreamingTranscriptionClient : IAsyncDisposable, IDisposable
         }
 
         return processed;
+    }
+
+    /// <summary>
+    /// Undoes the sentence-opener recapitalization <see cref="SmartSpacing.RemoveFillerWords"/>
+    /// applies when it isn't warranted (a non-first streaming delta).
+    ///
+    /// <see cref="SmartSpacing.RemoveFillerWords"/> only forces a capital when the
+    /// ORIGINAL text's first token was a leading filler AND the character
+    /// surviving right after that filler (skipping an optional comma + whitespace)
+    /// was lowercase - so that's the exact condition checked here, rather than
+    /// eyeballing the whole string's before/after casing (which both under- and
+    /// over-reverts): a filler the STT itself capitalized ("Um, this works") still
+    /// needs reverting even though its raw first character was already uppercase,
+    /// while a real proper noun surviving a lowercase filler ("um, Paris is
+    /// beautiful") must NOT be reverted just because the raw text opened lowercase.
+    /// </summary>
+    private static string RevertMidTranscriptRecapitalization(string original, string afterFillerRemoval)
+    {
+        if (afterFillerRemoval.Length == 0 || !char.IsUpper(afterFillerRemoval[0]))
+            return afterFillerRemoval;
+
+        var leadingMatch = LeadingFillerRegex.Match(original);
+        if (!leadingMatch.Success)
+            return afterFillerRemoval;
+
+        var index = leadingMatch.Index + leadingMatch.Length;
+        if (index < original.Length && original[index] == ',')
+            index++;
+        while (index < original.Length && char.IsWhiteSpace(original[index]))
+            index++;
+
+        if (index >= original.Length || !char.IsLower(original[index]))
+            return afterFillerRemoval;
+
+        return char.ToLower(afterFillerRemoval[0]) + afterFillerRemoval.Substring(1);
     }
 
     /// <summary>

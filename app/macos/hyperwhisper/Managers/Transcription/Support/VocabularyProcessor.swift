@@ -25,7 +25,7 @@ class VocabularyProcessor {
     ///
     /// This is the canonical per-word logic shared by the batch
     /// (`applyVocabularyReplacements`) and streaming
-    /// (`RecordingTranscriptionFlow.applyStreamingVocabulary`) paths so they
+    /// (`TranscriptionTextProcessing.applyStreamingVocabulary`) paths so they
     /// behave identically:
     /// - both `word` and `replacement` are trimmed, and an empty trimmed word or
     ///   empty trimmed replacement is a no-op (an empty `word` would build the

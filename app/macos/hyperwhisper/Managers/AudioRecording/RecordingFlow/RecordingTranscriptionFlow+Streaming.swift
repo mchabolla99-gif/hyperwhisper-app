@@ -425,20 +425,19 @@ extension RecordingTranscriptionFlow {
         // Capture language for the callback so we can use paste for CJK languages
         // instead of slow character-by-character typing. See TextInputService.typeSegment().
         let streamingLanguage = language
-        // FILLER-REMOVAL LANGUAGE HINT:
-        // `streamingLanguage` is nil for Auto-detect — the app's default — and no
-        // streaming provider (remote or local) surfaces a post-hoc detected
-        // language the way the batch path's HyperWhisperCloudProvider does
-        // (TranscriptionPipeline+Transcription.swift reads provider.detectedLanguage
-        // after transcribe() returns; streaming has no equivalent signal for any
-        // provider). Rather than silently never removing fillers for the default
-        // configuration, fall back to the system locale as an English-confidence
-        // proxy — mirroring the existing Locale.current fallback in
-        // AppleSpeechAnalyzerProvider.resolveLocale(language:). Gated so a
-        // non-English system locale never risks stripping real words; this hint
-        // is used ONLY for filler removal, never for typing/CJK/vocabulary, which
-        // continue to treat the language as genuinely unknown.
-        let fillerRemovalLanguage = Self.fillerRemovalLanguageHint(streamingLanguage: streamingLanguage)
+        // FILLER-REMOVAL LANGUAGE: `streamingLanguage` is nil for Auto-detect —
+        // the app's default — and no streaming provider (remote or local)
+        // surfaces a post-hoc detected language the way the batch path's
+        // HyperWhisperCloudProvider.detectedLanguage does (see
+        // TranscriptionTextProcessing.removeFillerWords: language: nil is a
+        // no-op). We deliberately do NOT guess a language from Locale.current
+        // (the system locale) here — that describes the user's OS environment,
+        // not the language of a given utterance, so an English-system-locale
+        // user dictating in German during Auto-detect would silently have real
+        // words stripped as fillers. Auto-detect streaming therefore does not
+        // get filler removal; this matches Windows's behavior for unknown
+        // language and the issue's documented batch-only fallback for cases
+        // where the setting can't be safely applied.
         let isLocalProvider = StreamingTranscriptionProvider(rawValue: provider)?.isLocal ?? false
         // Exact-vocab substitutions on the local path. Cloud providers
         // already receive vocabulary hints server-side; re-applying
@@ -466,9 +465,9 @@ extension RecordingTranscriptionFlow {
                 // Later deltas are mid-transcript continuations — check BEFORE this
                 // delta is appended below.
                 let isFirstConfirmedDelta = self.streamingAccumulatedText.isEmpty
-                let processedText = Self.processConfirmedStreamingDelta(
+                let processedText = TranscriptionTextProcessing.processConfirmedStreamingDelta(
                     text,
-                    language: fillerRemovalLanguage,
+                    language: streamingLanguage,
                     removeFillerWords: self.settingsManager?.removeFillerWords ?? true,
                     vocabulary: localVocabulary,
                     isFirstConfirmedDelta: isFirstConfirmedDelta
@@ -854,107 +853,6 @@ extension RecordingTranscriptionFlow {
         AppLogger.audio.info(
             "✅ Streaming transcription stopped and saved. deliveryMode=\(deliveryMode.rawValue, privacy: .public) target=\(sessionTarget ?? "unknown", privacy: .public)"
         )
-    }
-
-    /// Case-insensitive, word-boundary-anchored exact-match vocabulary
-    /// substitution. Used on the local Parakeet streaming path so that
-    /// confirmed deltas benefit from the user's vocabulary before typing.
-    ///
-    /// Delegates to `VocabularyProcessor.applyHardenedReplacement` — the same
-    /// hardened matcher the batch path uses — so streaming no longer mangles
-    /// substrings (e.g. "Kat"→"Katherine" no longer rewrites "category"). This
-    /// trades the previous `.diacriticInsensitive` matching for word-boundary
-    /// safety, deliberately matching the batch matcher's behavior.
-    fileprivate nonisolated static func applyStreamingVocabulary(_ text: String, vocabulary: [VocabularyEntrySnapshot]) -> String {
-        var updated = text
-        for entry in vocabulary {
-            guard let replacement = entry.replacement?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !replacement.isEmpty else {
-                continue
-            }
-            updated = VocabularyProcessor.applyHardenedReplacement(to: updated, word: entry.word, replacement: replacement)
-        }
-        return updated
-    }
-
-    /// Confirmed-delta transform for streaming transcription: filler-word
-    /// removal → voice-command processing → vocabulary substitution, mirroring
-    /// the batch path's order (`TranscriptionPipeline+Transcription.swift`).
-    ///
-    /// Extracted as a pure static function so it's directly testable without
-    /// standing up `RecordingTranscriptionFlow`/`AppState`/`SettingsManager`.
-    /// Only ever call this on confirmed/final deltas — applying filler removal
-    /// to interim/partial text would cause words to visibly pop in and out as
-    /// the partial hypothesis changes.
-    ///
-    /// - Parameter isFirstConfirmedDelta: Whether this is the session's first
-    ///   confirmed delta. `TranscriptionTextProcessing.removeFillerWords`
-    ///   recapitalizes the word after a leading filler on the assumption that
-    ///   it is processing the START of a whole transcript — true for the batch
-    ///   path, and for a session's first delta, but WRONG for a later delta
-    ///   (e.g. "um, this works" following an earlier confirmed "I think" is
-    ///   mid-transcript, not a new sentence). Defaults to `true` so existing
-    ///   call sites/tests that don't pass it keep today's sentence-opener
-    ///   behavior.
-    nonisolated static func processConfirmedStreamingDelta(
-        _ text: String,
-        language: String?,
-        removeFillerWords: Bool,
-        vocabulary: [VocabularyEntrySnapshot],
-        isFirstConfirmedDelta: Bool = true
-    ) -> String {
-        var withoutFillers = removeFillerWords
-            ? TranscriptionTextProcessing.removeFillerWords(text, language: language)
-            : text
-
-        if removeFillerWords && !isFirstConfirmedDelta {
-            withoutFillers = revertMidTranscriptRecapitalization(original: text, afterFillerRemoval: withoutFillers)
-        }
-
-        var processedText = TranscriptionTextProcessing.processVoiceCommands(withoutFillers)
-
-        if !vocabulary.isEmpty {
-            processedText = applyStreamingVocabulary(processedText, vocabulary: vocabulary)
-        }
-
-        return processedText
-    }
-
-    /// Undoes the sentence-opener recapitalization `removeFillerWords` applies
-    /// when it isn't warranted (a non-first streaming delta). Only reverses it
-    /// when the raw delta itself opened lowercase — if the delta already opened
-    /// uppercase, leave it as-is, since that's not something filler removal did.
-    fileprivate nonisolated static func revertMidTranscriptRecapitalization(
-        original: String,
-        afterFillerRemoval: String
-    ) -> String {
-        guard let originalFirst = original.first, originalFirst.isLowercase,
-              let resultFirst = afterFillerRemoval.first, resultFirst.isUppercase
-        else {
-            return afterFillerRemoval
-        }
-        return resultFirst.lowercased() + afterFillerRemoval.dropFirst()
-    }
-
-    /// Best-effort language hint for streaming filler-word removal only.
-    /// Auto-detect sessions pass `language: nil` everywhere else in the
-    /// streaming flow (typing/CJK handling, vocabulary) — those continue to
-    /// treat the language as genuinely unknown. But no streaming provider
-    /// (remote or local) surfaces a post-hoc detected language the way the
-    /// batch path's `HyperWhisperCloudProvider.detectedLanguage` does, so
-    /// `removeFillerWords` would otherwise silently never fire for the app's
-    /// default (Auto-detect) configuration. Mirrors the existing
-    /// `Locale.current` fallback in `AppleSpeechAnalyzerProvider.resolveLocale`:
-    /// only activates when the system locale is confidently English, so a
-    /// non-English auto-detect session is never at risk of losing real words.
-    fileprivate nonisolated static func fillerRemovalLanguageHint(streamingLanguage: String?) -> String? {
-        if let streamingLanguage {
-            return streamingLanguage
-        }
-        guard Locale.current.language.languageCode?.identifier.lowercased() == "en" else {
-            return nil
-        }
-        return "en"
     }
 
     fileprivate func bestStreamingCommitText(for deliveryMode: StreamingDeliveryMode) -> String {

@@ -508,8 +508,10 @@ internal static class Program
             {
                 // A confirmed segment that is JUST "uh"/"um"/"er" (already trimmed, no
                 // surrounding whitespace) must be stripped down to empty, same as a filler
-                // appearing mid-sentence — regression coverage for the boundary case where
-                // the old regex required whitespace on at least one side to match.
+                // appearing mid-sentence — regression coverage for the boundary case that
+                // SmartSpacing.RemoveFillerWords's shared regex (whitespace required on at
+                // least one side, since it's also reachable from the ungated batch path)
+                // can't cover on its own. Handled by a streaming-local check instead.
                 var config = new StreamingSessionConfig(
                     LicenseKey: null,
                     DeviceId: null,
@@ -552,6 +554,59 @@ internal static class Program
                 var secondDelta = client.AppendFinalTranscript("um, this works");
                 Assert(secondDelta == "this works",
                     $"expected a later delta's leading word to stay lowercase (mid-transcript), got '{secondDelta}'");
+            });
+
+            Run("StreamingTranscriptionClient.AppendFinalTranscript reverts recapitalization even when the STT capitalized the filler itself", () =>
+            {
+                // Under-reversion regression: the STT commonly capitalizes a filler as if
+                // it were a sentence opener ("Um, this works") even mid-transcript. The raw
+                // delta's first character is therefore already uppercase, but
+                // SmartSpacing.RemoveFillerWords still forces a capital on the surviving
+                // word — a later delta must still revert that, since the actual signal is
+                // whether the word AFTER the filler was originally lowercase, not the
+                // filler's own casing.
+                var config = new StreamingSessionConfig(
+                    LicenseKey: null,
+                    DeviceId: null,
+                    Language: "en",
+                    Vocabulary: null,
+                    ApiKey: null,
+                    Model: null,
+                    FastFormatting: false,
+                    RemoveFillerWords: true);
+
+                var client = new StreamingTranscriptionClient(new NoOpStreamingProviderStrategy(), config);
+                client.AppendFinalTranscript("I think");
+
+                var secondDelta = client.AppendFinalTranscript("Um, this works");
+                Assert(secondDelta == "this works",
+                    $"expected the surviving word to stay lowercase (mid-transcript) even though the raw filler was capitalized, got '{secondDelta}'");
+            });
+
+            Run("StreamingTranscriptionClient.AppendFinalTranscript preserves a real proper noun surviving a lowercase filler", () =>
+            {
+                // Over-reversion regression: "um, Paris is beautiful" opens with a
+                // lowercase filler, but the surviving word ("Paris") is a genuine proper
+                // noun that was already uppercase in the raw input —
+                // SmartSpacing.RemoveFillerWords's forced-uppercase step is a no-op here,
+                // so there is nothing to revert. A later delta must NOT lowercase it to
+                // "paris" just because the raw text happened to open lowercase.
+                var config = new StreamingSessionConfig(
+                    LicenseKey: null,
+                    DeviceId: null,
+                    Language: "en",
+                    Vocabulary: null,
+                    ApiKey: null,
+                    Model: null,
+                    FastFormatting: false,
+                    RemoveFillerWords: true);
+
+                var client = new StreamingTranscriptionClient(new NoOpStreamingProviderStrategy(), config);
+                client.AppendFinalTranscript("I think");
+
+                var secondDelta = client.AppendFinalTranscript("um, Paris is beautiful");
+                Assert(secondDelta == "Paris is beautiful",
+                    $"expected the real proper noun to stay capitalized, got '{secondDelta}'");
             });
 
             Run("BackupExportSettingsPage initializes under WPF", () =>
